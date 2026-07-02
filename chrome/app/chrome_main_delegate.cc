@@ -473,62 +473,6 @@ std::optional<int> HandlePackExtensionSwitches(
 }
 #endif  // !BUILDFLAG(ENABLE_EXTENSIONS)
 
-#if BUILDFLAG(ENABLE_PROCESS_SINGLETON)
-std::optional<int> AcquireProcessSingleton(
-    const base::FilePath& user_data_dir) {
-  // Take the Chrome process singleton lock. The process can become the
-  // Browser process if it succeed to take the lock. Otherwise, the
-  // command-line is sent to the actual Browser process and the current
-  // process can be exited.
-  ChromeProcessSingleton::CreateInstance(user_data_dir);
-
-#if BUILDFLAG(IS_LINUX)
-  // Read the xdg-activation token and set it in the command line for the
-  // duration of the notification in order to ensure this is propagated to an
-  // already running browser process if it exists.
-  // If this is the only browser process the global token will be available for
-  // use after this as well.
-  // The activation token received from the launching app is used later when
-  // activating an existing browser window.
-  base::nix::ScopedXdgActivationTokenInjector activation_token_injector(
-      *base::CommandLine::ForCurrentProcess(), *base::Environment::Create());
-#endif
-  ProcessSingleton::NotifyResult notify_result =
-      ChromeProcessSingleton::GetInstance()->NotifyOtherProcessOrCreate();
-  UMA_HISTOGRAM_ENUMERATION("Chrome.ProcessSingleton.NotifyResult",
-                            notify_result, ProcessSingleton::kNumNotifyResults);
-
-  switch (notify_result) {
-    case ProcessSingleton::PROCESS_NONE:
-      break;
-
-    case ProcessSingleton::PROCESS_NOTIFIED: {
-      // Ensure there is an instance of ResourceBundle that is initialized for
-      // localized string resource accesses.
-      ui::ScopedStartupResourceBundle startup_resource_bundle;
-      printf("%s\n", base::SysWideToNativeMB(
-                         base::UTF16ToWide(l10n_util::GetStringUTF16(
-                             IDS_USED_EXISTING_BROWSER)))
-                         .c_str());
-      return CHROME_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED;
-    }
-
-    case ProcessSingleton::PROFILE_IN_USE:
-      return CHROME_RESULT_CODE_PROFILE_IN_USE;
-
-    case ProcessSingleton::LOCK_ERROR:
-      LOG(ERROR) << "Failed to create a ProcessSingleton for your profile "
-                    "directory. This means that running multiple instances "
-                    "would start multiple browser processes rather than "
-                    "opening a new window in the existing process. Aborting "
-                    "now to avoid profile corruption.";
-      return CHROME_RESULT_CODE_PROFILE_IN_USE;
-  }
-
-  return std::nullopt;
-}
-#endif
-
 struct MainFunction {
   const char* name;
   int (*function)(content::MainFunctionParams);
@@ -763,31 +707,12 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
   base::FilePath user_data_dir =
       base::PathService::CheckedGet(chrome::DIR_USER_DATA);
 
-  // On platforms that support the process rendezvous, acquire the process
-  // singleton. In case of failure, it means there is already a running browser
-  // instance that handled the command-line.
-  if (auto process_singleton_result = AcquireProcessSingleton(user_data_dir);
-      process_singleton_result.has_value()) {
-    // To ensure that the histograms emitted in this process are reported in
-    // case of early exit, report the metrics accumulated this session with a
-    // future session's metrics.
-    DeferBrowserMetrics(user_data_dir);
-
-#if BUILDFLAG(IS_WIN)
-    // In the case the process is not the singleton process, the uninstall tasks
-    // need to be executed here. A window will be displayed asking to close all
-    // running instances.
-    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
-            switches::kUninstall)) {
-      // Ensure there is an instance of ResourceBundle that is initialized
-      // for localized string resource accesses.
-      ui::ScopedStartupResourceBundle startup_resource_bundle;
-      return DoUninstallTasks(browser_util::IsBrowserAlreadyRunning());
-    }
-#endif
-
-    return process_singleton_result;
-  }
+  // Create the process singleton instance early so that it is available
+  // throughout startup. The actual rendezvous (NotifyOtherProcessOrCreate)
+  // is deferred to ChromeBrowserMainParts::PreMainMessageLoopRunImpl, where
+  // the UI toolkit is initialized, so that the profile-in-use dialog can be
+  // shown when the lock is held by a process on another host.
+  ChromeProcessSingleton::CreateInstance(user_data_dir);
 #endif
 
 #if BUILDFLAG(IS_WIN)

@@ -13,6 +13,7 @@
 #include "base/base_switches.h"
 #include "base/check.h"
 #include "base/command_line.h"
+#include "base/environment.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
 #include "base/memory/raw_ptr.h"
@@ -293,6 +294,7 @@
 #include "chrome/browser/ui/startup/startup_browser_creator.h"
 
 #if BUILDFLAG(IS_LINUX)
+#include "base/nix/scoped_xdg_activation_token_injector.h"
 #include "base/nix/xdg_util.h"
 #endif
 #endif  // BUILDFLAG(ENABLE_PROCESS_SINGLETON)
@@ -1438,10 +1440,6 @@ void ChromeBrowserMainParts::PostCreateThreads() {
   }
 #endif
 
-#if BUILDFLAG(ENABLE_PROCESS_SINGLETON)
-  ChromeProcessSingleton::GetInstance()->StartWatching();
-#endif
-
   tracing::SetupSystemTracingFromFieldTrial();
   tracing::SetupBackgroundTracingFromCommandLine();
   tracing::SetupPresetTracingFromFieldTrial();
@@ -1780,6 +1778,44 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
   // Make sure aura::Env has been initialized.
   CHECK(aura::Env::GetInstance());
 #endif
+
+#if BUILDFLAG(ENABLE_PROCESS_SINGLETON)
+  // When another process is running, use that process instead of starting a
+  // new one. This is done here (after the UI toolkit is initialized) so that
+  // the profile-in-use dialog can be shown when the lock is held by a process
+  // on another host.
+#if BUILDFLAG(IS_LINUX)
+  base::nix::ScopedXdgActivationTokenInjector activation_token_injector(
+      *base::CommandLine::ForCurrentProcess(), *base::Environment::Create());
+#endif
+  const ProcessSingleton::NotifyResult notify_result =
+      ChromeProcessSingleton::GetInstance()->NotifyOtherProcessOrCreate();
+  UMA_HISTOGRAM_ENUMERATION("Chrome.ProcessSingleton.NotifyResult",
+                            notify_result,
+                            ProcessSingleton::kNumNotifyResults);
+
+  switch (notify_result) {
+    case ProcessSingleton::PROCESS_NONE:
+      // No process already running, fall through to starting a new one.
+      ChromeProcessSingleton::GetInstance()->StartWatching();
+      break;
+
+    case ProcessSingleton::PROCESS_NOTIFIED:
+      printf("%s\n", l10n_util::GetStringUTF8(IDS_USED_EXISTING_BROWSER).c_str());
+      return CHROME_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED;
+
+    case ProcessSingleton::PROFILE_IN_USE:
+      return CHROME_RESULT_CODE_PROFILE_IN_USE;
+
+    case ProcessSingleton::LOCK_ERROR:
+      LOG(ERROR) << "Failed to create a ProcessSingleton for your profile "
+                    "directory. This means that running multiple instances "
+                    "would start multiple browser processes rather than "
+                    "opening a new window in the existing process. Aborting "
+                    "now to avoid profile corruption.";
+      return CHROME_RESULT_CODE_PROFILE_IN_USE;
+  }
+#endif  // BUILDFLAG(ENABLE_PROCESS_SINGLETON)
 
 #if BUILDFLAG(IS_WIN)
   // We must call DoUpgradeTasks now that we own the browser singleton to
